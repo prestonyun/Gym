@@ -1,0 +1,132 @@
+import gymnasium as gym
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.distributions as distributions
+import torch.nn.functional as F
+import numpy as np
+from gymnasium import spaces
+
+
+class HolographicAssociativeMemory(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super(HolographicAssociativeMemory, self).__init__()
+        self.weight = nn.Parameter(torch.randn(hidden_size, input_size))
+        
+    def forward(self, x):
+        x = x @ self.weight.T
+        return x
+
+
+
+class HolographicTransformerNetwork(nn.Module):
+    def __init__(self, input_size, output_size, hidden_size):
+        super(HolographicTransformerNetwork, self).__init__()
+        self.ham1 = HolographicAssociativeMemory(input_size, hidden_size)
+        self.ham2 = HolographicAssociativeMemory(hidden_size, hidden_size)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        x = self.ham1(x)
+        x = self.ham2(x)
+        x = self.fc(x)
+        return x
+
+
+def normalize_vectors(vectors):
+    norms = torch.norm(vectors, dim=1, keepdim=True)
+    return vectors / norms
+
+
+def train(env, model, optimizer, gamma, num_episodes, device):
+    total_rewards = []
+    threshold = 500
+    for i in range(num_episodes):
+        state = torch.tensor(env.reset()[0], dtype=torch.float32).to(device)
+        done = False
+        episode_reward = 0
+        log_probs = []
+        rewards = []
+
+        while True:
+            state = state.clone().detach().requires_grad_(True).unsqueeze(0)
+            action, log_prob = select_action(state, model)
+
+            step_result = env.step(action.item())
+            next_state, reward, done = step_result[:3]
+            next_state = torch.tensor(next_state, dtype=torch.float32).to(device)
+            reward = torch.tensor(reward, dtype=torch.float32).to(device)
+            info = step_result[3]
+            episode_reward += reward
+
+            log_probs.append(log_prob)
+            rewards.append(reward)
+
+            if done:
+                break
+
+            state = next_state
+            if episode_reward >= threshold:
+                #print(f"Solved after {i+1} episodes!")
+                break
+            if i >= 100:
+                avg_reward = sum(total_rewards[-100:]) / 100
+                if avg_reward >= threshold:
+                    print(f"Solved after {i+1} episodes!")
+                    break
+        
+        total_rewards.append(episode_reward)
+        print('Episode %d: reward=%.2f' % (i+1, episode_reward))
+        
+
+        # Compute the expected returns for each time step
+        Gt = 0
+        for t in reversed(range(len(rewards))):
+            Gt = gamma * Gt + rewards[t]
+
+        # Compute the loss and update the model parameters
+        optimizer.zero_grad()
+        for t in range(len(log_probs)):
+            loss = -log_probs[t] * Gt
+            loss.backward(retain_graph=True)
+
+        # Normalize the gradients to improve training stability
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+
+        optimizer.step()
+
+    return total_rewards
+
+def select_action(state, model):
+    state = state.clone().detach().requires_grad_(True)
+    action_probs = model(state)
+    action_probs = F.softmax(action_probs, dim=1)  # apply softmax to convert logits to probabilities
+    dist = distributions.Categorical(action_probs)
+    action = dist.sample()
+    return action, dist.log_prob(action)
+
+def main():
+    env = gym.make('CartPole-v1')#, render_mode='human')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(4,), dtype=np.float32)
+    env.observation_space = observation_space
+    input_size = env.observation_space.shape[0]
+    output_size = env.action_space.n
+    hidden_size = 1024
+    model = HolographicTransformerNetwork(input_size, output_size, hidden_size)
+    optimizer = optim.Adam(model.parameters(), lr=0.01)
+    gamma = .95
+    num_episodes = 1000
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    total = train(env, model, optimizer, gamma, num_episodes, device)
+    #print(total)
+        
+    torch.save(model, 'model.pt')
+
+    env.close() 
+
+if __name__ == '__main__':
+    print(torch.cuda.is_available())
+    main()
